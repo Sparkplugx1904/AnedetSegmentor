@@ -161,8 +161,8 @@ class MainActivity : AppCompatActivity() {
                     // Update overlay dengan hasil segmentasi
                     binding.overlayView.setResults(
                         results,
-                        imageProxy.width,
-                        imageProxy.height
+                        bitmap.width,
+                        bitmap.height
                     )
                     
                     // Update info panel
