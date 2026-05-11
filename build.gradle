@@ -1,0 +1,13 @@
+// Lokasi: C:\Users\Ananda\AndroidStudioProjects\AnedetSegmentor\build.gradle
+
+plugins {
+    // Deklarasikan plugin di sini dengan VERSINYA
+    id 'com.android.application' version '8.2.0' apply false
+    id 'com.android.library' version '8.2.0' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.20' apply false
+}
+
+// Opsional: Task untuk membersihkan build folder
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}
