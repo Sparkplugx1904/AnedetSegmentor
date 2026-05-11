@@ -30,7 +30,7 @@ class ConjunctivaSegmentor(context: Context) {
     companion object {
         private const val TAG = "ConjunctivaSegmentor"
         private const val MODEL_PATH = "models/best_float16.tflite"
-        private const val CONFIDENCE_THRESHOLD = 0.00001f  // Very low for debugging
+        private const val CONFIDENCE_THRESHOLD = 0.4f
         private const val IOU_THRESHOLD = 0.45f
     }
 
@@ -254,36 +254,47 @@ class ConjunctivaSegmentor(context: Context) {
         val maskH = mask.size
         val maskW = mask[0].size
         val threshold = 0.5f
-        
-        // Find contour points (simplified - just find boundary points)
-        val points = mutableListOf<Pair<Float, Float>>()
-        
-        // Sample points around the mask boundary
-        for (y in 0 until maskH step 2) {
-            for (x in 0 until maskW step 2) {
+
+        // 1. Determine the bounding box in mask coordinates (80x80)
+        val leftMask = ((xCenter - width / 2) * maskW).toInt().coerceIn(0, maskW - 1)
+        val topMask = ((yCenter - height / 2) * maskH).toInt().coerceIn(0, maskH - 1)
+        val rightMask = ((xCenter + width / 2) * maskW).toInt().coerceIn(0, maskW - 1)
+        val bottomMask = ((yCenter + height / 2) * maskH).toInt().coerceIn(0, maskH - 1)
+
+        val leftPoints = mutableListOf<Pair<Float, Float>>()
+        val rightPoints = mutableListOf<Pair<Float, Float>>()
+
+        // 2. Scan each row within the bounding box to find the boundary points
+        for (y in topMask..bottomMask) {
+            var firstX = -1
+            var lastX = -1
+
+            for (x in leftMask..rightMask) {
                 if (mask[y][x] > threshold) {
-                    // Check if it's a boundary point
-                    val isBoundary = (x == 0 || x == maskW - 1 || y == 0 || y == maskH - 1 ||
-                            mask[y - 1][x] <= threshold || mask[y + 1][x] <= threshold ||
-                            mask[y][x - 1] <= threshold || mask[y][x + 1] <= threshold)
-                    
-                    if (isBoundary) {
-                        // Convert mask coordinates to image coordinates
-                        // Mask is relative to bbox
-                        val relX = x.toFloat() / maskW
-                        val relY = y.toFloat() / maskH
-                        
-                        val imgX = ((xCenter - width / 2 + relX * width) * originalWidth).coerceIn(0f, originalWidth.toFloat())
-                        val imgY = ((yCenter - height / 2 + relY * height) * originalHeight).coerceIn(0f, originalHeight.toFloat())
-                        
-                        points.add(Pair(imgX, imgY))
-                    }
+                    if (firstX == -1) firstX = x
+                    lastX = x
+                }
+            }
+
+            if (firstX != -1) {
+                // Convert mask coordinates back to original image coordinates
+                val imgY = (y.toFloat() / maskH) * originalHeight
+
+                leftPoints.add(Pair((firstX.toFloat() / maskW) * originalWidth, imgY))
+                if (firstX != lastX) {
+                    rightPoints.add(Pair((lastX.toFloat() / maskW) * originalWidth, imgY))
                 }
             }
         }
-        
-        // If no points found, return bbox as polygon
-        if (points.isEmpty()) {
+
+        // 3. Combine points into a single ordered loop to avoid zigzagging
+        // Top-to-bottom for the left edge, then bottom-to-top for the right edge
+        val combinedPolygon = mutableListOf<Pair<Float, Float>>()
+        combinedPolygon.addAll(leftPoints)
+        combinedPolygon.addAll(rightPoints.reversed())
+
+        // If no points found, return bbox as fallback
+        if (combinedPolygon.isEmpty()) {
             val left = ((xCenter - width / 2) * originalWidth).coerceIn(0f, originalWidth.toFloat())
             val top = ((yCenter - height / 2) * originalHeight).coerceIn(0f, originalHeight.toFloat())
             val right = ((xCenter + width / 2) * originalWidth).coerceIn(0f, originalWidth.toFloat())
@@ -297,7 +308,7 @@ class ConjunctivaSegmentor(context: Context) {
             )
         }
         
-        return points
+        return combinedPolygon
     }
 
     private fun applyNMS(results: List<SegmentationResult>): List<SegmentationResult> {
