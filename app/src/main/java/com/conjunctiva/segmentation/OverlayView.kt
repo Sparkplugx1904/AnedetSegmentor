@@ -1,13 +1,23 @@
 package com.conjunctiva.segmentation
 
 import android.content.Context
-import android.graphics.*
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Rect
+import android.graphics.Typeface
 import android.util.AttributeSet
 import android.view.View
 
 /**
- * Custom View untuk menggambar overlay masking di atas kamera
- * Menggunakan transparent overlay agar performa tetap smooth
+ * Custom View untuk menggambar overlay segmentasi di atas PreviewView kamera.
+ *
+ * Bug #4 Fix — Coordinate Mapping:
+ * PreviewView menggunakan scaleType="fillCenter" (fit-center / letterbox), bukan
+ * stretch. OverlayView harus mengikuti logika yang sama: hitung scale tunggal
+ * (min dari scaleX & scaleY) dan tambahkan offset padding di sisi yang kosong,
+ * supaya bounding-box dan polygon tepat sejajar dengan gambar yang tampil.
  */
 class OverlayView @JvmOverloads constructor(
     context: Context,
@@ -15,169 +25,149 @@ class OverlayView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    private var results: List<SegmentationResult> = emptyList()
-    private var imageWidth: Int = 0
+    private var results:     List<SegmentationResult> = emptyList()
+    private var imageWidth:  Int = 0
     private var imageHeight: Int = 0
-    
-    // Paint untuk menggambar polygon
+
+    // ── Paints ───────────────────────────────────────────────────────────────
+
     private val maskPaint = Paint().apply {
-        style = Paint.Style.FILL
-        color = Color.argb(100, 255, 0, 0) // Merah semi-transparan
+        style       = Paint.Style.FILL
+        color       = Color.argb(110, 255, 50, 50)
         isAntiAlias = true
     }
-    
-    // Paint untuk border polygon
+
     private val borderPaint = Paint().apply {
-        style = Paint.Style.STROKE
-        color = Color.RED
+        style       = Paint.Style.STROKE
+        color       = Color.rgb(255, 80, 80)
         strokeWidth = 3f
         isAntiAlias = true
     }
-    
-    // Paint untuk bounding box
+
     private val boxPaint = Paint().apply {
-        style = Paint.Style.STROKE
-        color = Color.GREEN
+        style       = Paint.Style.STROKE
+        color       = Color.rgb(0, 230, 100)
         strokeWidth = 4f
         isAntiAlias = true
     }
-    
-    // Paint untuk text
+
     private val textPaint = Paint().apply {
-        color = Color.WHITE
-        textSize = 40f
+        color       = Color.WHITE
+        textSize    = 42f
         isAntiAlias = true
-        typeface = Typeface.DEFAULT_BOLD
+        typeface    = Typeface.DEFAULT_BOLD
     }
-    
-    private val textBackgroundPaint = Paint().apply {
-        color = Color.argb(180, 0, 0, 0)
+
+    private val textBgPaint = Paint().apply {
+        color = Color.argb(190, 0, 0, 0)
         style = Paint.Style.FILL
     }
 
-    /**
-     * Update hasil segmentasi dan trigger redraw
-     */
+    // ── Public API ────────────────────────────────────────────────────────────
+
     fun setResults(results: List<SegmentationResult>, imageWidth: Int, imageHeight: Int) {
-        this.results = results
-        this.imageWidth = imageWidth
+        this.results     = results
+        this.imageWidth  = imageWidth
         this.imageHeight = imageHeight
-        invalidate() // Trigger onDraw()
+        invalidate()
     }
+
+    // ── Drawing ───────────────────────────────────────────────────────────────
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        
-        if (results.isEmpty() || imageWidth == 0 || imageHeight == 0) {
-            return
-        }
-        
-        // Hitung scale factor untuk mapping dari koordinat gambar ke koordinat view
-        val scaleX = width.toFloat() / imageWidth
-        val scaleY = height.toFloat() / imageHeight
-        
-        // Gambar setiap hasil deteksi
+        if (results.isEmpty() || imageWidth == 0 || imageHeight == 0) return
+
+        // Bug #4 Fix ─ Fit-center (letterbox) scaling, sama seperti PreviewView fillCenter
+        // Hitung scale tunggal yang mempertahankan aspect ratio gambar
+        val scale   = minOf(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
+        // Offset padding di sisi yang tidak terisi (letter/pillarbox)
+        val offsetX = (width  - imageWidth  * scale) / 2f
+        val offsetY = (height - imageHeight * scale) / 2f
+
         for (result in results) {
-            // 1. Gambar polygon masking
-            drawPolygon(canvas, result.polygon, scaleX, scaleY)
-            
-            // 2. Gambar bounding box
-            drawBoundingBox(canvas, result.boundingBox, scaleX, scaleY)
-            
-            // 3. Gambar label confidence
-            drawLabel(canvas, result, scaleX, scaleY)
+            drawPolygon(canvas, result.polygon,     scale, offsetX, offsetY)
+            drawBoundingBox(canvas, result.boundingBox, scale, offsetX, offsetY)
+            drawLabel(canvas, result,                   scale, offsetX, offsetY)
         }
     }
 
+    /**
+     * Konversi koordinat gambar ke koordinat view menggunakan fit-center transform.
+     */
+    private fun imgToViewX(x: Float, scale: Float, offsetX: Float) = x * scale + offsetX
+    private fun imgToViewY(y: Float, scale: Float, offsetY: Float) = y * scale + offsetY
+
     private fun drawPolygon(
-        canvas: Canvas,
+        canvas:  Canvas,
         polygon: List<Pair<Float, Float>>,
-        scaleX: Float,
-        scaleY: Float
+        scale:   Float, offsetX: Float, offsetY: Float
     ) {
         if (polygon.size < 3) return
-        
+
         val path = Path()
-        
-        // Mulai dari titik pertama
-        val firstPoint = polygon[0]
-        path.moveTo(firstPoint.first * scaleX, firstPoint.second * scaleY)
-        
-        // Gambar garis ke titik-titik berikutnya
+        val first = polygon[0]
+        path.moveTo(imgToViewX(first.first, scale, offsetX),
+                    imgToViewY(first.second, scale, offsetY))
+
         for (i in 1 until polygon.size) {
-            val point = polygon[i]
-            path.lineTo(point.first * scaleX, point.second * scaleY)
+            val pt = polygon[i]
+            path.lineTo(imgToViewX(pt.first, scale, offsetX),
+                        imgToViewY(pt.second, scale, offsetY))
         }
-        
-        // Tutup path
         path.close()
-        
-        // Gambar fill
+
         canvas.drawPath(path, maskPaint)
-        
-        // Gambar border
         canvas.drawPath(path, borderPaint)
     }
 
     private fun drawBoundingBox(
         canvas: Canvas,
-        box: BoundingBox,
-        scaleX: Float,
-        scaleY: Float
+        box:    BoundingBox,
+        scale:  Float, offsetX: Float, offsetY: Float
     ) {
-        val left = box.left * scaleX
-        val top = box.top * scaleY
-        val right = box.right * scaleX
-        val bottom = box.bottom * scaleY
-        
-        canvas.drawRect(left, top, right, bottom, boxPaint)
+        val l = imgToViewX(box.left,   scale, offsetX)
+        val t = imgToViewY(box.top,    scale, offsetY)
+        val r = imgToViewX(box.right,  scale, offsetX)
+        val b = imgToViewY(box.bottom, scale, offsetY)
+        canvas.drawRect(l, t, r, b, boxPaint)
     }
 
     private fun drawLabel(
-        canvas: Canvas,
-        result: SegmentationResult,
-        scaleX: Float,
-        scaleY: Float
+        canvas:  Canvas,
+        result:  SegmentationResult,
+        scale:   Float, offsetX: Float, offsetY: Float
     ) {
-        val confidence = (result.confidence * 100).toInt()
-        val label = "Conjunctiva ${confidence}%"
-        
-        // Posisi label di atas bounding box
-        val x = result.boundingBox.left * scaleX
-        val y = result.boundingBox.top * scaleY - 10
-        
-        // Ukur text
-        val textBounds = Rect()
-        textPaint.getTextBounds(label, 0, label.length, textBounds)
-        
-        // Gambar background
-        val padding = 10f
+        val pct   = (result.confidence * 100).toInt()
+        val label = "Conjunctiva $pct%"
+
+        val x = imgToViewX(result.boundingBox.left, scale, offsetX)
+        val y = imgToViewY(result.boundingBox.top,  scale, offsetY) - 12f
+
+        val bounds = Rect()
+        textPaint.getTextBounds(label, 0, label.length, bounds)
+        val pad = 10f
+
         canvas.drawRect(
-            x - padding,
-            y - textBounds.height() - padding,
-            x + textBounds.width() + padding,
-            y + padding,
-            textBackgroundPaint
+            x - pad,
+            y - bounds.height() - pad,
+            x + bounds.width() + pad,
+            y + pad,
+            textBgPaint
         )
-        
-        // Gambar text
         canvas.drawText(label, x, y, textPaint)
     }
 
-    /**
-     * Ubah warna masking
-     */
-    fun setMaskColor(color: Int, alpha: Int = 100) {
+    // ── Utility setters ───────────────────────────────────────────────────────
+
+    fun setMaskColor(color: Int, alpha: Int = 110) {
         maskPaint.color = Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
         invalidate()
     }
 
-    /**
-     * Ubah ketebalan border
-     */
-    fun setBorderWidth(width: Float) {
-        borderPaint.strokeWidth = width
-        boxPaint.strokeWidth = width + 1
+    fun setBorderWidth(strokeWidth: Float) {
+        borderPaint.strokeWidth = strokeWidth
+        boxPaint.strokeWidth    = strokeWidth + 1f
         invalidate()
     }
 }
