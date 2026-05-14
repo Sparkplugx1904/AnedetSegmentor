@@ -18,7 +18,6 @@ import org.tensorflow.lite.support.image.ops.ResizeWithCropOrPadOp
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
@@ -99,7 +98,7 @@ class ConjunctivaSegmentor(context: Context) {
 
         // 4. Post-processing
         val boxesAndScores = output0.floatArray
-        val prototypes = output1.floatArray // Prototype shape: [1, 160, 160, 32]
+        val prototypes = output1.floatArray
 
         val detections = mutableListOf<Detection>()
 
@@ -118,7 +117,6 @@ class ConjunctivaSegmentor(context: Context) {
             val confidence = max(score0, score1)
 
             if (confidence > CONFIDENCE_THRESHOLD) {
-                // Use inputSize directly since xc, yc, w, h are in 0..inputSize range (640)
                 val x1 = (xc - w / 2f)
                 val y1 = (yc - h / 2f)
                 val x2 = (xc + w / 2f)
@@ -145,8 +143,7 @@ class ConjunctivaSegmentor(context: Context) {
         // Return best detection info (just for UI stats) and the full mask
         val best = filteredDetections.maxByOrNull { it.confidence }
 
-        // Map detection bounding box back to original image coordinates (undo letterbox)
-        // Note: filteredDetections still use the 640x640 space (with letterbox)
+        // Map bounding box back to original image coordinates (undo letterbox)
         val finalBox = best?.let {
             val bx1 = (it.boundingBox.left - padX) / newWidth * bitmap.width
             val by1 = (it.boundingBox.top - padY) / newHeight * bitmap.height
@@ -183,26 +180,23 @@ class ConjunctivaSegmentor(context: Context) {
         val maskColor = Color.argb(128, 170, 102, 204)
 
         for (det in detections) {
-            // Scale bounding box from inputSize space (640) to mask size (160x160)
+            // Scale bounding box to mask size (160x160)
             val bx1 = (det.boundingBox.left / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
             val by1 = (det.boundingBox.top / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
             val bx2 = (det.boundingBox.right / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
             val by2 = (det.boundingBox.bottom / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
 
-            // Only iterate over the bounding box area for efficiency
             for (y in by1..by2) {
                 val yOffset = y * maskSize
                 for (x in bx1..bx2) {
                     val index = yOffset + x
                     var sum = 0f
                     val protoOffset = index * numProtoChannels
-
-                    // Vector-like multiplication
                     for (c in 0 until numProtoChannels) {
                         sum += prototypes[protoOffset + c] * det.maskCoeffs[c]
                     }
-
-                    if (sum > 0f) { // sum > 0 is equivalent to sigmoid(sum) > 0.5
+                    // sum > 0 is equivalent to sigmoid(sum) > 0.5
+                    if (sum > 0f) {
                         pixels[index] = maskColor
                     }
                 }

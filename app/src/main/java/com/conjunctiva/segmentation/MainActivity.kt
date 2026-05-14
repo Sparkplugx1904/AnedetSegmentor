@@ -151,7 +151,6 @@ class MainActivity : AppCompatActivity() {
                     val bh = bitmap.height
 
                     mainHandler.post {
-                        // Check if activity is still alive to avoid "BufferQueue abandoned" or other issues
                         if (!isFinishing && !isDestroyed) {
                             binding.overlayView.setResults(result, bw, bh)
                             completedInferences.incrementAndGet()

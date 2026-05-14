@@ -46,8 +46,6 @@ object ImageUtils {
     }
 
     private fun fallbackToJpeg(imageProxy: ImageProxy): Bitmap {
-        // Implementation for YUV to Bitmap via YuvImage/JPEG if ever needed
-        // (Simplified for brevity as RGBA is used)
         val buffer = imageProxy.planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
