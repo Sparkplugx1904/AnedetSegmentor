@@ -111,6 +111,7 @@ class MainActivity : AppCompatActivity() {
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
+                        Log.v(TAG, "Analyzing frame: ${imageProxy.width}x${imageProxy.height}, format: ${imageProxy.format}")
                         val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                         imageProxy.close()
 
