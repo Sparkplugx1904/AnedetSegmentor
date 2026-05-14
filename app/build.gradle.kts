@@ -51,12 +51,11 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
 
-    // TFLite - using api instead of implementation to ensure all classes are available
+    // TFLite
     implementation(libs.tensorflow.lite)
     implementation(libs.tensorflow.lite.support)
-    // Use gpu-api instead of gpu to avoid GpuDelegateFactory issues
+    implementation(libs.tensorflow.lite.gpu)
     implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
 
     // CameraX
     implementation(libs.androidx.camera.core)
