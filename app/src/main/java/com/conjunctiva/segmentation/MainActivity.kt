@@ -2,7 +2,10 @@ package com.conjunctiva.segmentation
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -10,24 +13,27 @@ import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
 import com.conjunctiva.segmentation.databinding.ActivityMainBinding
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : AppCompatActivity() {
     
     private lateinit var binding: ActivityMainBinding
     private lateinit var cameraExecutor: ExecutorService
+    private lateinit var inferenceExecutor: ExecutorService
     private lateinit var segmentor: ConjunctivaSegmentor
-    
+    private val mainHandler = Handler(Looper.getMainLooper())
+    /** Antrian kapasitas 1: hanya frame terbaru (backpressure selaras STRATEGY_KEEP_ONLY_LATEST). */
+    private val frameQueue = ArrayBlockingQueue<Bitmap>(1)
+    private val completedInferences = AtomicInteger(0)
+
     private var camera: Camera? = null
     private var preview: Preview? = null
     private var imageAnalyzer: ImageAnalysis? = null
-    
+
     private var frameCount = 0
     private var lastFpsTimestamp = System.currentTimeMillis()
     private var processEveryNFrames = 1 // Proses setiap frame, ubah ke 2-3 jika lag
@@ -43,8 +49,8 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Inisialisasi executor untuk kamera
-        cameraExecutor = Executors.newSingleThreadExecutor()
+        cameraExecutor = Executors.newFixedThreadPool(2)
+        inferenceExecutor = Executors.newSingleThreadExecutor()
 
         // Inisialisasi segmentor
         try {
@@ -53,9 +59,13 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing segmentor", e)
             Toast.makeText(this, "Error loading model: ${e.message}", Toast.LENGTH_LONG).show()
+            inferenceExecutor.shutdown()
+            cameraExecutor.shutdown()
             finish()
             return
         }
+
+        startInferenceConsumer()
 
         // Cek permission kamera
         if (allPermissionsGranted()) {
@@ -135,44 +145,62 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    /**
+     * Satu thread konsumer inferensi: paralel dengan pipeline kamera — bitmap dikonversi dan
+     * [ImageProxy] ditutup di thread analyzer; inferensi tidak memblokir frame berikutnya.
+     */
+    private fun startInferenceConsumer() {
+        inferenceExecutor.execute {
+            while (!Thread.currentThread().isInterrupted) {
+                val bitmap = try {
+                    frameQueue.take()
+                } catch (_: InterruptedException) {
+                    break
+                }
+                try {
+                    val startTime = System.currentTimeMillis()
+                    val results = segmentor.segment(bitmap)
+                    val inferenceTime = System.currentTimeMillis() - startTime
+                    val bw = bitmap.width
+                    val bh = bitmap.height
+                    mainHandler.post {
+                        binding.overlayView.setResults(results, bw, bh)
+                        completedInferences.incrementAndGet()
+                        updateInfoPanel(inferenceTime, results.size)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error processing image", e)
+                } finally {
+                    if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+                }
+            }
+        }
+    }
+
     private fun processImage(imageProxy: ImageProxy) {
         frameCount++
-        
-        // Skip frames untuk performa (opsional)
+
         if (frameCount % processEveryNFrames != 0) {
             imageProxy.close()
             return
         }
 
-        lifecycleScope.launch(Dispatchers.Default) {
-            try {
-                val startTime = System.currentTimeMillis()
-                
-                // Konversi ImageProxy ke Bitmap
-                val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
-                
-                // Jalankan segmentasi
-                val results = segmentor.segment(bitmap)
-                
-                val inferenceTime = System.currentTimeMillis() - startTime
-                
-                // Update UI
-                withContext(Dispatchers.Main) {
-                    // Update overlay dengan hasil segmentasi
-                    binding.overlayView.setResults(
-                        results,
-                        bitmap.width,
-                        bitmap.height
-                    )
-                    
-                    // Update info panel
-                    updateInfoPanel(inferenceTime, results.size)
-                }
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Error processing image", e)
-            } finally {
-                imageProxy.close()
+        val bitmap = try {
+            ImageUtils.imageProxyToBitmap(imageProxy)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error converting ImageProxy", e)
+            null
+        } finally {
+            imageProxy.close()
+        }
+        if (bitmap == null) return
+
+        if (!frameQueue.offer(bitmap)) {
+            frameQueue.poll()?.recycle()
+            if (!frameQueue.offer(bitmap)) {
+                bitmap.recycle()
             }
         }
     }
@@ -188,16 +216,23 @@ class MainActivity : AppCompatActivity() {
         val currentTime = System.currentTimeMillis()
         val timeDiff = currentTime - lastFpsTimestamp
         if (timeDiff >= 1000) {
-            val fps = (frameCount * 1000.0 / timeDiff).toInt()
+            val n = completedInferences.getAndSet(0)
+            val fps = (n * 1000.0 / timeDiff).toInt().coerceAtLeast(0)
             binding.tvFps.text = "FPS: $fps"
-            frameCount = 0
             lastFpsTimestamp = currentTime
         }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        inferenceExecutor.shutdownNow()
         cameraExecutor.shutdown()
-        segmentor.close()
+        while (true) {
+            val b = frameQueue.poll() ?: break
+            if (!b.isRecycled) b.recycle()
+        }
+        if (::segmentor.isInitialized) {
+            segmentor.close()
+        }
+        super.onDestroy()
     }
 }
