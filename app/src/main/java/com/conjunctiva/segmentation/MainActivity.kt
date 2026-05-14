@@ -105,19 +105,23 @@ class MainActivity : AppCompatActivity() {
                 }
 
             imageAnalyzer = ImageAnalysis.Builder()
-                .setTargetResolution(Size(640, 640))
+                .setTargetResolution(Size(1280, 720))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        Log.v(TAG, "Analyzing frame: ${imageProxy.width}x${imageProxy.height}, format: ${imageProxy.format}")
-                        val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
-                        imageProxy.close()
+                        try {
+                            val bitmap = imageProxy.toBitmap()
+                            val rotated = ImageUtils.rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
 
-                        if (!frameQueue.offer(bitmap)) {
-                            frameQueue.poll()?.recycle()
-                            frameQueue.offer(bitmap)
+                            if (!frameQueue.offer(rotated)) {
+                                frameQueue.poll()?.recycle()
+                                frameQueue.offer(rotated)
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error converting ImageProxy to Bitmap", e)
+                        } finally {
+                            imageProxy.close()
                         }
                     }
                 }
