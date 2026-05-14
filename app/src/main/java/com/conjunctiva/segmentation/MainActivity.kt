@@ -145,17 +145,20 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 try {
-                    val startTime = System.currentTimeMillis()
                     val result = segmentor.segment(bitmap)
-                    val inferenceTime = System.currentTimeMillis() - startTime
 
                     val bw = bitmap.width
                     val bh = bitmap.height
 
                     mainHandler.post {
-                        binding.overlayView.setResults(result, bw, bh)
-                        completedInferences.incrementAndGet()
-                        updateInfoPanel(inferenceTime, if (result != null) 1 else 0)
+                        // Check if activity is still alive to avoid "BufferQueue abandoned" or other issues
+                        if (!isFinishing && !isDestroyed) {
+                            binding.overlayView.setResults(result, bw, bh)
+                            completedInferences.incrementAndGet()
+                            result?.let {
+                                updateInfoPanel(it.inferenceTime, 1)
+                            } ?: updateInfoPanel(0, 0)
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Inference error", e)

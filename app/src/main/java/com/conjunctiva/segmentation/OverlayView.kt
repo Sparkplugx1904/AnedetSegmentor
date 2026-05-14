@@ -71,8 +71,8 @@ class OverlayView @JvmOverloads constructor(
         // Draw label
         result?.let {
             val label = "Conjunctiva ${(it.confidence * 100).toInt()}%"
-            val x = it.boundingBox.left * (drawW / 640f) + offsetX
-            val y = (it.boundingBox.top * (drawH / 640f) + offsetY).coerceAtLeast(40f)
+            val x = it.boundingBox.left * (drawW / imageWidth) + offsetX
+            val y = (it.boundingBox.top * (drawH / imageHeight) + offsetY).coerceAtLeast(40f)
 
             textPaint.getTextBounds(label, 0, label.length, textBounds)
             val padding = 8f
