@@ -2,371 +2,236 @@ package com.conjunctiva.segmentation
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.RectF
 import android.util.Log
-import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
-import java.io.FileInputStream
+import org.tensorflow.lite.support.common.FileUtil
+import org.tensorflow.lite.support.common.ops.NormalizeOp
+import org.tensorflow.lite.support.image.ImageProcessor
+import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.support.image.ops.ResizeOp
+import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Optimized Conjunctiva Segmentation using YOLOv8 INT8 model and GPU acceleration.
- */
 class ConjunctivaSegmentor(context: Context) {
 
     private var interpreter: Interpreter
     private var gpuDelegate: GpuDelegate? = null
 
-    private var inputSize = 320
-    private val numChannels = 3
-    private var protoH = 80
-    private var protoW = 80
-    private var numProtoChannels = 32
-    private var numDetections = 300
-    private var numFeatures = 38
-
-    private var outerIsDetections = true
-    private lateinit var outputBoxes: Any 
-    private var outputProtos: Any? = null
-    private var protoChannelFirst = true
-    private var hasProtoOutput = false
-
-    private lateinit var inputBuffer: ByteBuffer
-    private var isQuantized = false
+    private val inputSize = 640
+    private val maskSize = 160
+    private val numProtoChannels = 32
+    private val numDetections = 300
+    private val numElements = 38 // 4 box + 2 class + 32 mask coefficients
 
     companion object {
         private const val TAG = "ConjunctivaSegmentor"
-        private const val MODEL_ASSET = "yolo26n-seg_best_int8.tflite"
-        private const val CONFIDENCE_THRESHOLD = 0.35f
-        private const val IOU_THRESHOLD = 0.45f
-        private const val MASK_THRESHOLD = 0.5f
+        private const val MODEL_PATH = "yolo26n-seg_best_float16.tflite"
+        private const val CONFIDENCE_THRESHOLD = 0.45f
+        private const val IOU_THRESHOLD = 0.5f
     }
 
     init {
-        val modelFile = loadModelFile(context)
+        val model = FileUtil.loadMappedFile(context, MODEL_PATH)
         val options = Interpreter.Options()
         
-        val inputTensor = Interpreter(modelFile).use { tempInterpreter ->
-            tempInterpreter.getInputTensor(0)
-        }
-        isQuantized = inputTensor.dataType() == DataType.UINT8 || inputTensor.dataType() == DataType.INT8
-        Log.d(TAG, "Model isQuantized=$isQuantized, DataType=${inputTensor.dataType()}")
-        
-        // GPU delegate doesn't work well with INT8 quantized models
-        // Use CPU with XNNPACK for better compatibility
-        if (!isQuantized) {
-            try {
-                gpuDelegate = GpuDelegate()
-                options.addDelegate(gpuDelegate)
-                Log.d(TAG, "GPU Acceleration enabled for FLOAT32 model.")
-            } catch (e: Exception) {
-                Log.w(TAG, "GPU Acceleration failed: ${e.message}. Using CPU with XNNPACK.")
-                gpuDelegate?.close()
-                gpuDelegate = null
-                options.setUseXNNPACK(true)
-                options.setNumThreads(4)
-            }
+        val compatList = CompatibilityList()
+        if (compatList.isDelegateSupportedOnThisDevice) {
+            val delegateOptions = compatList.bestOptionsForThisDevice
+            gpuDelegate = GpuDelegate(delegateOptions)
+            options.addDelegate(gpuDelegate)
+            Log.d(TAG, "GPU Delegate is supported and enabled.")
         } else {
-            Log.d(TAG, "INT8 quantized model detected. Using CPU with XNNPACK for better compatibility.")
-            options.setUseXNNPACK(true)
             options.setNumThreads(4)
+            Log.d(TAG, "GPU Delegate is not supported, using CPU.")
         }
 
-        interpreter = Interpreter(modelFile, options)
-
-        val inputTensor = interpreter.getInputTensor(0)
-        isQuantized = inputTensor.dataType() == DataType.UINT8 || inputTensor.dataType() == DataType.INT8
-        Log.d(TAG, "Model isQuantized=$isQuantized, DataType=${inputTensor.dataType()}")
-
-        resolveInputTensor()
-        allocateBuffersFromModel()
-        allocateInputBuffer()
-
-        Log.d(TAG, "Init complete: ${inputSize}x${inputSize}, detections=$numDetections, features=$numFeatures")
+        interpreter = Interpreter(model, options)
+        Log.d(TAG, "Interpreter initialized with model: $MODEL_PATH")
     }
 
-    private fun resolveInputTensor() {
-        val shape = interpreter.getInputTensor(0).shape()
-        inputSize = if (shape.size == 4) {
-            if (shape[1] == 3) shape[2] else shape[1]
-        } else 320
-    }
+    fun segment(bitmap: Bitmap): SegmentationResult? {
+        val startTime = System.currentTimeMillis()
 
-    private fun allocateBuffersFromModel() {
-        val s0 = interpreter.getOutputTensor(0).shape()
-        val a = s0[1]
-        val b = s0[2]
+        // 1. Preprocessing
+        val imageProcessor = ImageProcessor.Builder()
+            .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))
+            .add(NormalizeOp(0f, 255f))
+            .build()
 
-        if (a < b) {
-            numFeatures = a
-            numDetections = b
-            outerIsDetections = false
-        } else {
-            numDetections = a
-            numFeatures = b
-            outerIsDetections = true
-        }
+        var tensorImage = TensorImage(org.tensorflow.lite.DataType.FLOAT32)
+        tensorImage.load(bitmap)
+        tensorImage = imageProcessor.process(tensorImage)
 
-        // Allocate based on data type
-        val dtype0 = interpreter.getOutputTensor(0).dataType()
-        outputBoxes = if (dtype0 == DataType.FLOAT32) {
-            Array(1) { Array(s0[1]) { FloatArray(s0[2]) } }
-        } else {
-            Array(1) { Array(s0[1]) { ByteArray(s0[2]) } }
-        }
+        // 2. Prepare outputs
+        // Output 0: [1, 300, 38]
+        val output0 = TensorBuffer.createFixedSize(intArrayOf(1, numDetections, numElements), org.tensorflow.lite.DataType.FLOAT32)
+        // Output 1: [1, 160, 160, 32]
+        val output1 = TensorBuffer.createFixedSize(intArrayOf(1, maskSize, maskSize, numProtoChannels), org.tensorflow.lite.DataType.FLOAT32)
 
-        hasProtoOutput = interpreter.outputTensorCount > 1
-        if (hasProtoOutput) {
-            val s1 = interpreter.getOutputTensor(1).shape()
-            val dtype1 = interpreter.getOutputTensor(1).dataType()
-            
-            if (s1[1] == 32) {
-                protoChannelFirst = true
-                numProtoChannels = s1[1]
-                protoH = s1[2]
-                protoW = s1[3]
-                outputProtos = if (dtype1 == DataType.FLOAT32) {
-                    Array(1) { Array(numProtoChannels) { Array(protoH) { FloatArray(protoW) } } }
-                } else {
-                    Array(1) { Array(numProtoChannels) { Array(protoH) { ByteArray(protoW) } } }
-                }
-            } else {
-                protoChannelFirst = false
-                protoH = s1[1]
-                protoW = s1[2]
-                numProtoChannels = s1[3]
-                outputProtos = if (dtype1 == DataType.FLOAT32) {
-                    Array(1) { Array(protoH) { Array(protoW) { FloatArray(numProtoChannels) } } }
-                } else {
-                    Array(1) { Array(protoH) { Array(protoW) { ByteArray(numProtoChannels) } } }
-                }
-            }
-        }
-    }
+        val outputs = mapOf(0 to output0.buffer, 1 to output1.buffer)
 
-    private fun allocateInputBuffer() {
-        val bytesPerChannel = if (isQuantized) 1 else 4
-        val inputByteSize = 1 * inputSize * inputSize * numChannels * bytesPerChannel
-        inputBuffer = ByteBuffer.allocateDirect(inputByteSize).apply {
-            order(ByteOrder.nativeOrder())
-        }
-    }
+        // 3. Run Inference
+        interpreter.runForMultipleInputsOutputs(arrayOf(tensorImage.buffer), outputs)
 
-    private fun loadModelFile(context: Context): MappedByteBuffer {
-        val afd = context.assets.openFd(MODEL_ASSET)
-        FileInputStream(afd.fileDescriptor).use { fis ->
-            return fis.channel.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength)
-        }
-    }
+        // 4. Post-processing
+        val boxesAndScores = output0.floatArray
+        val prototypes = output1.floatArray
 
-    private fun getBoxValue(det: Int, feat: Int): Float {
-        val tensor = interpreter.getOutputTensor(0)
-        val quantParams = tensor.quantizationParams()
-        val scale = quantParams.scale
-        val zeroPoint = quantParams.zeroPoint
-
-        return if (outerIsDetections) {
-            if (outputBoxes is Array<*> && (outputBoxes as Array<Array<FloatArray>>)[0][0] is FloatArray) {
-                (outputBoxes as Array<Array<FloatArray>>)[0][det][feat]
-            } else {
-                val raw = (outputBoxes as Array<Array<ByteArray>>)[0][det][feat].toInt() and 0xFF
-                (raw.toFloat() - zeroPoint.toFloat()) * scale
-            }
-        } else {
-            if (outputBoxes is Array<*> && (outputBoxes as Array<Array<FloatArray>>)[0][0] is FloatArray) {
-                (outputBoxes as Array<Array<FloatArray>>)[0][feat][det]
-            } else {
-                val raw = (outputBoxes as Array<Array<ByteArray>>)[0][feat][det].toInt() and 0xFF
-                (raw.toFloat() - zeroPoint.toFloat()) * scale
-            }
-        }
-    }
-
-    private fun getProtoValue(c: Int, y: Int, x: Int): Float {
-        val p = outputProtos ?: return 0f
-        val tensor = interpreter.getOutputTensor(1)
-        val quantParams = tensor.quantizationParams()
-        val scale = quantParams.scale
-        val zeroPoint = quantParams.zeroPoint
-
-        return if (protoChannelFirst) {
-            if (p is Array<*> && (p as Array<Array<Array<FloatArray>>>)[0][0][0] is FloatArray) {
-                (p as Array<Array<Array<FloatArray>>>)[0][c][y][x]
-            } else {
-                val raw = (p as Array<Array<Array<ByteArray>>>)[0][c][y][x].toInt() and 0xFF
-                (raw.toFloat() - zeroPoint.toFloat()) * scale
-            }
-        } else {
-            if (p is Array<*> && (p as Array<Array<Array<FloatArray>>>)[0][0][0] is FloatArray) {
-                (p as Array<Array<Array<FloatArray>>>)[0][y][x][c]
-            } else {
-                val raw = (p as Array<Array<Array<ByteArray>>>)[0][y][x][c].toInt() and 0xFF
-                (raw.toFloat() - zeroPoint.toFloat()) * scale
-            }
-        }
-    }
-
-    fun segment(bitmap: Bitmap): List<SegmentationResult> {
-        val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        preprocessImage(resized)
-        
-        val outputs = mutableMapOf<Int, Any>(0 to outputBoxes)
-        outputProtos?.let { outputs[1] = it }
-        
-        interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
-        
-        if (resized !== bitmap) resized.recycle()
-        return postprocess(bitmap.width, bitmap.height)
-    }
-
-    private fun preprocessImage(bitmap: Bitmap) {
-        inputBuffer.rewind()
-        val pixels = IntArray(inputSize * inputSize)
-        bitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
-
-        for (px in pixels) {
-            val r = (px shr 16) and 0xFF
-            val g = (px shr 8) and 0xFF
-            val b = px and 0xFF
-            if (isQuantized) {
-                inputBuffer.put(r.toByte())
-                inputBuffer.put(g.toByte())
-                inputBuffer.put(b.toByte())
-            } else {
-                inputBuffer.putFloat(r / 255f)
-                inputBuffer.putFloat(g / 255f)
-                inputBuffer.putFloat(b / 255f)
-            }
-        }
-    }
-
-    private fun postprocess(origW: Int, origH: Int): List<SegmentationResult> {
-        val results = mutableListOf<SegmentationResult>()
-        val maskCoeffCount = (numFeatures - 4).coerceIn(0, 32) 
+        val detections = mutableListOf<Detection>()
 
         for (i in 0 until numDetections) {
-            val conf = getBoxValue(i, 4)
-            if (conf < CONFIDENCE_THRESHOLD) continue
+            val offset = i * numElements
+            
+            // YOLOv8-seg format: [xc, yc, w, h, class0, class1, coeff0...coeff31]
+            val xc = boxesAndScores[offset + 0]
+            val yc = boxesAndScores[offset + 1]
+            val w = boxesAndScores[offset + 2]
+            val h = boxesAndScores[offset + 3]
 
-            val xc = getBoxValue(i, 0)
-            val yc = getBoxValue(i, 1)
-            val w = getBoxValue(i, 2)
-            val h = getBoxValue(i, 3)
+            // Skor klasifikasi (indeks 4 dan 5)
+            val score0 = boxesAndScores[offset + 4]
+            val score1 = boxesAndScores[offset + 5]
+            val confidence = max(score0, score1)
 
-            val xcN = xc / inputSize
-            val ycN = yc / inputSize
-            val wN = w / inputSize
-            val hN = h / inputSize
+            if (confidence > CONFIDENCE_THRESHOLD) {
+                val x1 = (xc - w / 2f)
+                val y1 = (yc - h / 2f)
+                val x2 = (xc + w / 2f)
+                val y2 = (yc + h / 2f)
 
-            val coeffs = FloatArray(maskCoeffCount) { c -> getBoxValue(i, numFeatures - maskCoeffCount + c) }
-
-            val polygon = if (hasProtoOutput) {
-                val mask = generateMask(coeffs)
-                extractPolygonFromMask(mask, xcN, ycN, wN, hN, origW, origH)
-            } else {
-                bboxToPolygon(xcN, ycN, wN, hN, origW, origH)
-            }
-
-            results.add(SegmentationResult(
-                confidence = conf,
-                classId = 0,
-                boundingBox = BoundingBox(
-                    ((xcN - wN/2) * origW), ((ycN - hN/2) * origH),
-                    ((xcN + wN/2) * origW), ((ycN + hN/2) * origH)
-                ),
-                polygon = polygon
-            ))
-        }
-        return applyNMS(results)
-    }
-
-    private fun generateMask(coeffs: FloatArray): Array<FloatArray> {
-        val mask = Array(protoH) { FloatArray(protoW) }
-        for (y in 0 until protoH) {
-            for (x in 0 until protoW) {
-                var sum = 0f
-                for (c in 0 until coeffs.size) {
-                    sum += getProtoValue(c, y, x) * coeffs[c]
+                val coeffs = FloatArray(numProtoChannels)
+                for (j in 0 until numProtoChannels) {
+                    coeffs[j] = boxesAndScores[offset + 6 + j]
                 }
-                mask[y][x] = 1f / (1f + exp(-sum))
+
+                detections.add(Detection(RectF(x1, y1, x2, y2), confidence, coeffs))
             }
         }
-        return mask
+
+        val filteredDetections = nms(detections)
+        if (filteredDetections.isEmpty()) return null
+
+        // Generate combined mask
+        val finalMask = generateMask(filteredDetections, prototypes, bitmap.width, bitmap.height)
+
+        val inferenceTime = System.currentTimeMillis() - startTime
+        Log.d(TAG, "Inference and post-proc took: ${inferenceTime}ms")
+
+        // Return best detection info (just for UI stats) and the full mask
+        val best = filteredDetections.maxByOrNull { it.confidence }
+        return SegmentationResult(
+            confidence = best?.confidence ?: 0f,
+            boundingBox = best?.boundingBox ?: RectF(),
+            mask = finalMask
+        )
     }
 
-    private fun extractPolygonFromMask(
-        mask: Array<FloatArray>,
-        xcN: Float, ycN: Float, wN: Float, hN: Float,
-        origW: Int, origH: Int
-    ): List<Pair<Float, Float>> {
-        val left = ((xcN - wN / 2) * protoW).toInt().coerceIn(0, protoW - 1)
-        val top = ((ycN - hN / 2) * protoH).toInt().coerceIn(0, protoH - 1)
-        val right = ((xcN + wN / 2) * protoW).toInt().coerceIn(0, protoW - 1)
-        val bottom = ((ycN + hN / 2) * protoH).toInt().coerceIn(0, protoH - 1)
+    private fun generateMask(
+        detections: List<Detection>,
+        prototypes: FloatArray,
+        origW: Int,
+        origH: Int
+    ): Bitmap {
+        val maskBitmap = Bitmap.createBitmap(maskSize, maskSize, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(maskSize * maskSize)
 
-        val roiW = right - left + 1
-        val roiH = bottom - top + 1
-        if (roiW <= 0 || roiH <= 0) return emptyList()
+        // Reset pixels
+        pixels.fill(0)
 
-        val roiBinary = Array(roiH) { ry ->
-            BooleanArray(roiW) { rx -> mask[top + ry][left + rx] > MASK_THRESHOLD }
+        // For simplicity, we combine all masks into one 160x160 bitmap first
+        // In a real YOLOv8-seg pipeline, we should crop per box, but here we can sum them
+        val combinedMask = FloatArray(maskSize * maskSize)
+
+        for (det in detections) {
+            for (y in 0 until maskSize) {
+                for (x in 0 until maskSize) {
+                    var sum = 0f
+                    for (c in 0 until numProtoChannels) {
+                        // Prototype shape: [160, 160, 32]
+                        sum += prototypes[(y * maskSize + x) * numProtoChannels + c] * det.maskCoeffs[c]
+                    }
+                    val sigmoid = 1f / (1f + exp(-sum))
+                    if (sigmoid > 0.5f) {
+                        // Apply box constraint (scaled to 160x160)
+                        val bx1 = (det.boundingBox.left / inputSize) * maskSize
+                        val by1 = (det.boundingBox.top / inputSize) * maskSize
+                        val bx2 = (det.boundingBox.right / inputSize) * maskSize
+                        val by2 = (det.boundingBox.bottom / inputSize) * maskSize
+
+                        if (x >= bx1 && x <= bx2 && y >= by1 && y <= by2) {
+                            combinedMask[y * maskSize + x] = max(combinedMask[y * maskSize + x], sigmoid)
+                        }
+                    }
+                }
+            }
         }
 
-        val contour = MaskContour.contourFromBinaryRoi(roiBinary, 10)
-        return MaskContour.protoToImage(left, top, protoW, protoH, origW, origH, contour)
+        // Color: Ungu Muda (Light Purple) -> e.g., #AA66CC with alpha
+        val maskColor = Color.argb(128, 170, 102, 204)
+
+        for (i in pixels.indices) {
+            if (combinedMask[i] > 0.5f) {
+                pixels[i] = maskColor
+            } else {
+                pixels[i] = Color.TRANSPARENT
+            }
+        }
+
+        maskBitmap.setPixels(pixels, 0, maskSize, 0, 0, maskSize, maskSize)
+
+        // Upsample to original size
+        return Bitmap.createScaledBitmap(maskBitmap, origW, origH, true)
     }
 
-    private fun bboxToPolygon(xcN: Float, ycN: Float, wN: Float, hN: Float, origW: Int, origH: Int): List<Pair<Float, Float>> {
-        val l = (xcN - wN / 2) * origW
-        val t = (ycN - hN / 2) * origH
-        val r = (xcN + wN / 2) * origW
-        val b = (ycN + hN / 2) * origH
-        return listOf(Pair(l, t), Pair(r, t), Pair(r, b), Pair(l, b))
-    }
+    private fun nms(detections: List<Detection>): List<Detection> {
+        val sorted = detections.sortedByDescending { it.confidence }.toMutableList()
+        val selected = mutableListOf<Detection>()
 
-    private fun applyNMS(results: List<SegmentationResult>): List<SegmentationResult> {
-        val sorted = results.sortedByDescending { it.confidence }
-        val selected = mutableListOf<SegmentationResult>()
-        for (candidate in sorted) {
-            if (selected.none { calculateIoU(candidate.boundingBox, it.boundingBox) > IOU_THRESHOLD }) {
-                selected.add(candidate)
+        while (sorted.isNotEmpty()) {
+            val first = sorted.removeAt(0)
+            selected.add(first)
+            val iterator = sorted.iterator()
+            while (iterator.hasNext()) {
+                val next = iterator.next()
+                if (iou(first.boundingBox, next.boundingBox) > IOU_THRESHOLD) {
+                    iterator.remove()
+                }
             }
         }
         return selected
     }
 
-    private fun calculateIoU(a: BoundingBox, b: BoundingBox): Float {
-        val iL = max(a.left, b.left); val iT = max(a.top, b.top)
-        val iR = min(a.right, b.right); val iB = min(a.bottom, b.bottom)
-        if (iR <= iL || iB <= iT) return 0f
-        val inter = (iR - iL) * (iB - iT)
-        val areaA = (a.right - a.left) * (a.bottom - a.top)
-        val areaB = (b.right - b.left) * (b.bottom - b.top)
-        return inter / (areaA + areaB - inter)
+    private fun iou(a: RectF, b: RectF): Float {
+        val intersection = RectF()
+        if (!intersection.setIntersect(a, b)) return 0f
+        val intersectArea = intersection.width() * intersection.height()
+        val unionArea = (a.width() * a.height()) + (b.width() * b.height()) - intersectArea
+        return intersectArea / unionArea
     }
 
     fun close() {
         interpreter.close()
         gpuDelegate?.close()
     }
+
+    data class Detection(
+        val boundingBox: RectF,
+        val confidence: Float,
+        val maskCoeffs: FloatArray
+    )
+
+    data class SegmentationResult(
+        val confidence: Float,
+        val boundingBox: RectF,
+        val mask: Bitmap
+    )
 }
-
-data class SegmentationResult(
-    val confidence: Float,
-    val classId: Int,
-    val boundingBox: BoundingBox,
-    val polygon: List<Pair<Float, Float>>
-)
-
-data class BoundingBox(
-    val left: Float,
-    val top: Float,
-    val right: Float,
-    val bottom: Float
-)

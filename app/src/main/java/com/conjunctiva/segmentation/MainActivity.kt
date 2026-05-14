@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.util.Size
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -26,7 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var inferenceExecutor: ExecutorService
     private lateinit var segmentor: ConjunctivaSegmentor
     private val mainHandler = Handler(Looper.getMainLooper())
-    /** Antrian kapasitas 1: hanya frame terbaru (backpressure selaras STRATEGY_KEEP_ONLY_LATEST). */
+
     private val frameQueue = ArrayBlockingQueue<Bitmap>(1)
     private val completedInferences = AtomicInteger(0)
 
@@ -34,9 +35,7 @@ class MainActivity : AppCompatActivity() {
     private var preview: Preview? = null
     private var imageAnalyzer: ImageAnalysis? = null
 
-    private var frameCount = 0
     private var lastFpsTimestamp = System.currentTimeMillis()
-    private var processEveryNFrames = 1 // Proses setiap frame, ubah ke 2-3 jika lag
     
     companion object {
         private const val TAG = "MainActivity"
@@ -52,22 +51,18 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor = Executors.newFixedThreadPool(2)
         inferenceExecutor = Executors.newSingleThreadExecutor()
 
-        // Inisialisasi segmentor
         try {
             segmentor = ConjunctivaSegmentor(this)
             Log.d(TAG, "Segmentor initialized successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing segmentor", e)
             Toast.makeText(this, "Error loading model: ${e.message}", Toast.LENGTH_LONG).show()
-            inferenceExecutor.shutdown()
-            cameraExecutor.shutdown()
             finish()
             return
         }
 
         startInferenceConsumer()
 
-        // Cek permission kamera
         if (allPermissionsGranted()) {
             startCamera()
         } else {
@@ -91,11 +86,7 @@ class MainActivity : AppCompatActivity() {
             if (allPermissionsGranted()) {
                 startCamera()
             } else {
-                Toast.makeText(
-                    this,
-                    getString(R.string.camera_permission_required),
-                    Toast.LENGTH_SHORT
-                ).show()
+                Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
                 finish()
             }
         }
@@ -107,37 +98,36 @@ class MainActivity : AppCompatActivity() {
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
 
-            // Preview
             preview = Preview.Builder()
                 .build()
                 .also {
                     it.setSurfaceProvider(binding.previewView.surfaceProvider)
                 }
 
-            // Image Analysis untuk inference
             imageAnalyzer = ImageAnalysis.Builder()
-                .setTargetResolution(android.util.Size(640, 480))
+                .setTargetResolution(Size(640, 640))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        processImage(imageProxy)
+                        val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
+                        imageProxy.close()
+
+                        if (!frameQueue.offer(bitmap)) {
+                            frameQueue.poll()?.recycle()
+                            frameQueue.offer(bitmap)
+                        }
                     }
                 }
 
-            // Select back camera
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
-                // Unbind semua use case sebelum rebinding
                 cameraProvider.unbindAll()
-
-                // Bind use cases ke camera
                 camera = cameraProvider.bindToLifecycle(
                     this, cameraSelector, preview, imageAnalyzer
                 )
-
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
             }
@@ -145,10 +135,6 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /**
-     * Satu thread konsumer inferensi: paralel dengan pipeline kamera — bitmap dikonversi dan
-     * [ImageProxy] ditutup di thread analyzer; inferensi tidak memblokir frame berikutnya.
-     */
     private fun startInferenceConsumer() {
         inferenceExecutor.execute {
             while (!Thread.currentThread().isInterrupted) {
@@ -157,82 +143,49 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: InterruptedException) {
                     break
                 }
+
                 try {
                     val startTime = System.currentTimeMillis()
-                    val results = segmentor.segment(bitmap)
+                    val result = segmentor.segment(bitmap)
                     val inferenceTime = System.currentTimeMillis() - startTime
+
                     val bw = bitmap.width
                     val bh = bitmap.height
+
                     mainHandler.post {
-                        binding.overlayView.setResults(results, bw, bh)
+                        binding.overlayView.setResults(result, bw, bh)
                         completedInferences.incrementAndGet()
-                        updateInfoPanel(inferenceTime, results.size)
+                        updateInfoPanel(inferenceTime, if (result != null) 1 else 0)
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error processing image", e)
+                    Log.e(TAG, "Inference error", e)
                 } finally {
-                    if (!bitmap.isRecycled) {
-                        bitmap.recycle()
-                    }
+                    bitmap.recycle()
                 }
             }
         }
     }
 
-    private fun processImage(imageProxy: ImageProxy) {
-        frameCount++
-
-        if (frameCount % processEveryNFrames != 0) {
-            imageProxy.close()
-            return
-        }
-
-        val bitmap = try {
-            ImageUtils.imageProxyToBitmap(imageProxy)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error converting ImageProxy", e)
-            null
-        } finally {
-            imageProxy.close()
-        }
-        if (bitmap == null) return
-
-        if (!frameQueue.offer(bitmap)) {
-            frameQueue.poll()?.recycle()
-            if (!frameQueue.offer(bitmap)) {
-                bitmap.recycle()
-            }
-        }
-    }
-
     private fun updateInfoPanel(inferenceTime: Long, detectionCount: Int) {
-        // Update inference time
         binding.tvInferenceTime.text = "Inference: ${inferenceTime}ms"
-        
-        // Update detection count
         binding.tvDetections.text = "Detections: $detectionCount"
         
-        // Calculate FPS
         val currentTime = System.currentTimeMillis()
         val timeDiff = currentTime - lastFpsTimestamp
         if (timeDiff >= 1000) {
             val n = completedInferences.getAndSet(0)
-            val fps = (n * 1000.0 / timeDiff).toInt().coerceAtLeast(0)
+            val fps = (n * 1000.0 / timeDiff).toInt()
             binding.tvFps.text = "FPS: $fps"
             lastFpsTimestamp = currentTime
         }
     }
 
     override fun onDestroy() {
+        super.onDestroy()
         inferenceExecutor.shutdownNow()
         cameraExecutor.shutdown()
-        while (true) {
-            val b = frameQueue.poll() ?: break
-            if (!b.isRecycled) b.recycle()
-        }
         if (::segmentor.isInitialized) {
             segmentor.close()
         }
-        super.onDestroy()
     }
 }
