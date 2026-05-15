@@ -83,13 +83,12 @@ class OverlayView @JvmOverloads constructor(
         val offsetX = (640f - imageWidth * scale) / 2f
         val offsetY = (640f - imageHeight * scale) / 2f
 
-        // Correct order:
-        // 1. Subtract offset (translate to non-padded region)
-        // 2. Scale back to original frame dimensions
-        matrix.postTranslate(-offsetX, -offsetY)
-        matrix.postScale(1f/scale, 1f/scale)
-
-        // 3. Scale to View coordinates
+        // Corrected order for inverse mapping:
+        // 1. Scale 640-space back to original frame space
+        matrix.postScale(1f / scale, 1f / scale)
+        // 2. Remove padding (offset must be scaled to original frame space)
+        matrix.postTranslate(-offsetX / scale, -offsetY / scale)
+        // 3. Scale original frame to View coordinates
         matrix.postScale(sx, sy)
 
         canvas.drawBitmap(maskBitmap, matrix, null)

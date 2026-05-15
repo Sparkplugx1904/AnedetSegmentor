@@ -201,6 +201,10 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         inferenceExecutor.shutdownNow()
         cameraExecutor.shutdown()
+        lastResults?.forEach {
+            it.maskBitmap?.recycle()
+            it.cropBitmap?.recycle()
+        }
         if (::segmentor.isInitialized) {
             segmentor.close()
         }
