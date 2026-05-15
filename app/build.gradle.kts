@@ -55,7 +55,7 @@ dependencies {
     implementation(libs.tensorflow.lite)
     implementation(libs.tensorflow.lite.support)
     implementation(libs.tensorflow.lite.gpu)
-    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
+    implementation(libs.tensorflow.lite.gpu.api)
 
     // CameraX
     implementation(libs.androidx.camera.core)
