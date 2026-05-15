@@ -1,94 +1,57 @@
 package com.conjunctiva.segmentation
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
 import android.graphics.Matrix
-import android.graphics.Rect
-import android.graphics.YuvImage
-import android.util.Log
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
-/**
- * Optimized ImageUtils for high-performance frame conversion.
- */
 object ImageUtils {
-    private const val TAG = "ImageUtils"
 
+    /**
+     * Konversi ImageProxy (RGBA_8888) ke Bitmap dengan rotasi yang benar.
+     *
+     * KRITIS: Handle rowStride — di device nyata, rowStride > width * pixelStride
+     * karena ada padding bytes di ujung setiap row. Tanpa ini gambar miring/korup.
+     */
     fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
-        val format = imageProxy.format
-        
-        return when (format) {
-            ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888 -> {
-                rgbaToBitmap(imageProxy)
-            }
-            ImageFormat.YUV_420_888 -> {
-                yuvToBitmap(imageProxy)
-            }
-            else -> {
-                Log.e(TAG, "Unsupported image format: $format. Attempting YUV conversion.")
-                yuvToBitmap(imageProxy)
-            }
-        }
-    }
-
-    private fun rgbaToBitmap(imageProxy: ImageProxy): Bitmap {
         val plane = imageProxy.planes[0]
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * imageProxy.width
+        val pixelStride = plane.pixelStride
+        val buffer = plane.buffer
+        val width = imageProxy.width
+        val height = imageProxy.height
 
-        val bitmap = Bitmap.createBitmap(
-            imageProxy.width + rowPadding / pixelStride,
-            imageProxy.height,
-            Bitmap.Config.ARGB_8888
-        )
-        bitmap.copyPixelsFromBuffer(buffer)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
-        val finalBitmap = if (rowPadding > 0) {
-            val cropped = Bitmap.createBitmap(bitmap, 0, 0, imageProxy.width, imageProxy.height)
-            if (cropped != bitmap) bitmap.recycle()
-            cropped
+        if (rowStride == width * pixelStride) {
+            // Fast path: tidak ada row padding
+            buffer.rewind()
+            bitmap.copyPixelsFromBuffer(buffer)
         } else {
-            bitmap
+            // Slow path: strip padding bytes di ujung setiap row
+            val cleanBuffer = ByteBuffer.allocateDirect(width * height * pixelStride)
+            buffer.rewind()
+            for (row in 0 until height) {
+                buffer.position(row * rowStride)
+                val rowBytes = ByteArray(width * pixelStride)
+                buffer.get(rowBytes)
+                cleanBuffer.put(rowBytes)
+            }
+            cleanBuffer.rewind()
+            bitmap.copyPixelsFromBuffer(cleanBuffer)
         }
 
-        return rotateBitmap(finalBitmap, imageProxy.imageInfo.rotationDegrees)
+        // Rotasi agar bitmap orientasinya portrait benar
+        val rotation = imageProxy.imageInfo.rotationDegrees
+        return if (rotation != 0) rotateBitmap(bitmap, rotation) else bitmap
     }
 
-    private fun yuvToBitmap(imageProxy: ImageProxy): Bitmap {
-        val yBuffer = imageProxy.planes[0].buffer
-        val uBuffer = imageProxy.planes[1].buffer
-        val vBuffer = imageProxy.planes[2].buffer
-
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 = ByteArray(ySize + uSize + vSize)
-
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 100, out)
-        val imageBytes = out.toByteArray()
-        
-        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-        return rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
-    }
-
-    private fun rotateBitmap(bitmap: Bitmap, rotationDegrees: Int): Bitmap {
-        if (rotationDegrees == 0) return bitmap
-        val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-        if (rotated != bitmap) bitmap.recycle()
+    private fun rotateBitmap(src: Bitmap, degrees: Int): Bitmap {
+        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+        val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        if (rotated != src) {
+            src.recycle()
+        }
         return rotated
     }
 }

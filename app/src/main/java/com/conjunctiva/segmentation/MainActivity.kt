@@ -105,13 +105,12 @@ class MainActivity : AppCompatActivity() {
                 }
 
             imageAnalyzer = ImageAnalysis.Builder()
-                .setTargetResolution(Size(640, 640))
+                .setTargetResolution(Size(1280, 720))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        Log.v(TAG, "Analyzing frame: ${imageProxy.width}x${imageProxy.height}, format: ${imageProxy.format}")
                         val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                         imageProxy.close()
 
@@ -136,6 +135,8 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private var lastResults: List<SegmentResult>? = null
+
     private fun startInferenceConsumer() {
         inferenceExecutor.execute {
             while (!Thread.currentThread().isInterrupted) {
@@ -146,18 +147,25 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 try {
+                    val startTime = System.currentTimeMillis()
                     val result = segmentor.segment(bitmap)
+                    val inferenceTime = System.currentTimeMillis() - startTime
 
                     val bw = bitmap.width
                     val bh = bitmap.height
 
                     mainHandler.post {
                         if (!isFinishing && !isDestroyed) {
+                            // Recycle old bitmaps
+                            lastResults?.forEach { it.maskBitmap?.recycle() }
+                            lastResults = result
+
                             binding.overlayView.setResults(result, bw, bh)
                             completedInferences.incrementAndGet()
-                            result?.let {
-                                updateInfoPanel(it.inferenceTime, 1)
-                            } ?: updateInfoPanel(0, 0)
+                            updateInfoPanel(inferenceTime, result.size)
+                        } else {
+                            // Activity destroyed during inference
+                            result.forEach { it.maskBitmap?.recycle() }
                         }
                     }
                 } catch (e: Exception) {
