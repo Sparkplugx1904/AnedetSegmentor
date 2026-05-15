@@ -111,6 +111,7 @@ class MainActivity : AppCompatActivity() {
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
+                        Log.v(TAG, "Analyzing frame: ${imageProxy.width}x${imageProxy.height}, format: ${imageProxy.format}")
                         val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                         imageProxy.close()
 
@@ -145,17 +146,19 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 try {
-                    val startTime = System.currentTimeMillis()
                     val result = segmentor.segment(bitmap)
-                    val inferenceTime = System.currentTimeMillis() - startTime
 
                     val bw = bitmap.width
                     val bh = bitmap.height
 
                     mainHandler.post {
-                        binding.overlayView.setResults(result, bw, bh)
-                        completedInferences.incrementAndGet()
-                        updateInfoPanel(inferenceTime, if (result != null) 1 else 0)
+                        if (!isFinishing && !isDestroyed) {
+                            binding.overlayView.setResults(result, bw, bh)
+                            completedInferences.incrementAndGet()
+                            result?.let {
+                                updateInfoPanel(it.inferenceTime, 1)
+                            } ?: updateInfoPanel(0, 0)
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Inference error", e)

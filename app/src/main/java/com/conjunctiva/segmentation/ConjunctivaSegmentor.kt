@@ -14,10 +14,10 @@ import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
+import org.tensorflow.lite.support.image.ops.ResizeWithCropOrPadOp
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
@@ -45,13 +45,17 @@ class ConjunctivaSegmentor(context: Context) {
         
         val compatList = CompatibilityList()
         if (compatList.isDelegateSupportedOnThisDevice) {
-            val delegateOptions = compatList.bestOptionsForThisDevice
+            val delegateOptions = GpuDelegate.Options().apply {
+                setPrecisionLossAllowed(true) // Required for FP16 optimization
+                setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+            }
             gpuDelegate = GpuDelegate(delegateOptions)
             options.addDelegate(gpuDelegate)
-            Log.d(TAG, "GPU Delegate is supported and enabled.")
+            Log.d(TAG, "GPU Delegate is supported and enabled with FP16 optimizations.")
         } else {
             options.setNumThreads(4)
-            Log.d(TAG, "GPU Delegate is not supported, using CPU.")
+            options.setUseXNNPACK(true)
+            Log.d(TAG, "GPU Delegate is not supported, using CPU with XNNPACK.")
         }
 
         interpreter = Interpreter(model, options)
@@ -61,15 +65,25 @@ class ConjunctivaSegmentor(context: Context) {
     fun segment(bitmap: Bitmap): SegmentationResult? {
         val startTime = System.currentTimeMillis()
 
-        // 1. Preprocessing
+        val height = bitmap.height
+        val width = bitmap.width
+        val scale = min(inputSize.toFloat() / width, inputSize.toFloat() / height)
+        val newWidth = (width * scale).toInt()
+        val newHeight = (height * scale).toInt()
+
+        // 1. Preprocessing with Letterboxing
         val imageProcessor = ImageProcessor.Builder()
-            .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))
+            .add(ResizeOp(newHeight, newWidth, ResizeOp.ResizeMethod.BILINEAR))
+            .add(ResizeWithCropOrPadOp(inputSize, inputSize))
             .add(NormalizeOp(0f, 255f))
             .build()
 
         var tensorImage = TensorImage(org.tensorflow.lite.DataType.FLOAT32)
         tensorImage.load(bitmap)
         tensorImage = imageProcessor.process(tensorImage)
+
+        val padX = (inputSize - newWidth) / 2f
+        val padY = (inputSize - newHeight) / 2f
 
         // 2. Prepare outputs
         // Output 0: [1, 300, 38]
@@ -121,17 +135,28 @@ class ConjunctivaSegmentor(context: Context) {
         if (filteredDetections.isEmpty()) return null
 
         // Generate combined mask
-        val finalMask = generateMask(filteredDetections, prototypes, bitmap.width, bitmap.height)
+        val finalMask = generateMask(filteredDetections, prototypes, bitmap.width, bitmap.height, padX, padY, newWidth, newHeight)
 
         val inferenceTime = System.currentTimeMillis() - startTime
         Log.d(TAG, "Inference and post-proc took: ${inferenceTime}ms")
 
         // Return best detection info (just for UI stats) and the full mask
         val best = filteredDetections.maxByOrNull { it.confidence }
+        
+        // Map bounding box back to original image coordinates (undo letterbox)
+        val finalBox = best?.let {
+            val bx1 = (it.boundingBox.left - padX) / newWidth * bitmap.width
+            val by1 = (it.boundingBox.top - padY) / newHeight * bitmap.height
+            val bx2 = (it.boundingBox.right - padX) / newWidth * bitmap.width
+            val by2 = (it.boundingBox.bottom - padY) / newHeight * bitmap.height
+            RectF(bx1, by1, bx2, by2)
+        } ?: RectF()
+
         return SegmentationResult(
             confidence = best?.confidence ?: 0f,
-            boundingBox = best?.boundingBox ?: RectF(),
-            mask = finalMask
+            boundingBox = finalBox,
+            mask = finalMask,
+            inferenceTime = inferenceTime
         )
     }
 
@@ -139,7 +164,11 @@ class ConjunctivaSegmentor(context: Context) {
         detections: List<Detection>,
         prototypes: FloatArray,
         origW: Int,
-        origH: Int
+        origH: Int,
+        padX: Float,
+        padY: Float,
+        newW: Int,
+        newH: Int
     ): Bitmap {
         val maskBitmap = Bitmap.createBitmap(maskSize, maskSize, Bitmap.Config.ARGB_8888)
         val pixels = IntArray(maskSize * maskSize)
@@ -147,49 +176,48 @@ class ConjunctivaSegmentor(context: Context) {
         // Reset pixels
         pixels.fill(0)
 
-        // For simplicity, we combine all masks into one 160x160 bitmap first
-        // In a real YOLOv8-seg pipeline, we should crop per box, but here we can sum them
-        val combinedMask = FloatArray(maskSize * maskSize)
+        // Color: Ungu Muda (Light Purple) -> e.g., #AA66CC with alpha
+        val maskColor = Color.argb(128, 170, 102, 204)
 
         for (det in detections) {
-            for (y in 0 until maskSize) {
-                for (x in 0 until maskSize) {
-                    var sum = 0f
-                    for (c in 0 until numProtoChannels) {
-                        // Prototype shape: [160, 160, 32]
-                        sum += prototypes[(y * maskSize + x) * numProtoChannels + c] * det.maskCoeffs[c]
-                    }
-                    val sigmoid = 1f / (1f + exp(-sum))
-                    if (sigmoid > 0.5f) {
-                        // Apply box constraint (scaled to 160x160)
-                        val bx1 = (det.boundingBox.left / inputSize) * maskSize
-                        val by1 = (det.boundingBox.top / inputSize) * maskSize
-                        val bx2 = (det.boundingBox.right / inputSize) * maskSize
-                        val by2 = (det.boundingBox.bottom / inputSize) * maskSize
+            // Scale bounding box to mask size (160x160)
+            val bx1 = (det.boundingBox.left / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
+            val by1 = (det.boundingBox.top / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
+            val bx2 = (det.boundingBox.right / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
+            val by2 = (det.boundingBox.bottom / inputSize * maskSize).toInt().coerceIn(0, maskSize - 1)
 
-                        if (x >= bx1 && x <= bx2 && y >= by1 && y <= by2) {
-                            combinedMask[y * maskSize + x] = max(combinedMask[y * maskSize + x], sigmoid)
-                        }
+            for (y in by1..by2) {
+                val yOffset = y * maskSize
+                for (x in bx1..bx2) {
+                    val index = yOffset + x
+                    var sum = 0f
+                    val protoOffset = index * numProtoChannels
+                    for (c in 0 until numProtoChannels) {
+                        sum += prototypes[protoOffset + c] * det.maskCoeffs[c]
+                    }
+                    // sum > 0 is equivalent to sigmoid(sum) > 0.5
+                    if (sum > 0f) {
+                        pixels[index] = maskColor
                     }
                 }
             }
         }
 
-        // Color: Ungu Muda (Light Purple) -> e.g., #AA66CC with alpha
-        val maskColor = Color.argb(128, 170, 102, 204)
-
-        for (i in pixels.indices) {
-            if (combinedMask[i] > 0.5f) {
-                pixels[i] = maskColor
-            } else {
-                pixels[i] = Color.TRANSPARENT
-            }
-        }
-
         maskBitmap.setPixels(pixels, 0, maskSize, 0, 0, maskSize, maskSize)
 
+        // Crop the letterboxed mask back to the active area
+        val cropX = (padX / inputSize * maskSize).toInt().coerceAtLeast(0)
+        val cropY = (padY / inputSize * maskSize).toInt().coerceAtLeast(0)
+        val cropW = (newW.toFloat() / inputSize * maskSize).toInt().coerceIn(1, maskSize - cropX)
+        val cropH = (newH.toFloat() / inputSize * maskSize).toInt().coerceIn(1, maskSize - cropY)
+        
+        val croppedMask = Bitmap.createBitmap(maskBitmap, cropX, cropY, cropW, cropH)
+
         // Upsample to original size
-        return Bitmap.createScaledBitmap(maskBitmap, origW, origH, true)
+        val finalResult = Bitmap.createScaledBitmap(croppedMask, origW, origH, true)
+        
+        if (croppedMask != maskBitmap) maskBitmap.recycle()
+        return finalResult
     }
 
     private fun nms(detections: List<Detection>): List<Detection> {
@@ -232,6 +260,7 @@ class ConjunctivaSegmentor(context: Context) {
     data class SegmentationResult(
         val confidence: Float,
         val boundingBox: RectF,
-        val mask: Bitmap
+        val mask: Bitmap,
+        val inferenceTime: Long
     )
 }
