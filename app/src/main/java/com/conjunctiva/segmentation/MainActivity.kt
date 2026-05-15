@@ -157,7 +157,10 @@ class MainActivity : AppCompatActivity() {
                     mainHandler.post {
                         if (!isFinishing && !isDestroyed) {
                             // Recycle old bitmaps
-                            lastResults?.forEach { it.maskBitmap?.recycle() }
+                            lastResults?.forEach {
+                                it.maskBitmap?.recycle()
+                                it.cropBitmap?.recycle()
+                            }
                             lastResults = result
 
                             binding.overlayView.setResults(result, bw, bh)
@@ -165,7 +168,10 @@ class MainActivity : AppCompatActivity() {
                             updateInfoPanel(inferenceTime, result.size)
                         } else {
                             // Activity destroyed during inference
-                            result.forEach { it.maskBitmap?.recycle() }
+                            result.forEach {
+                                it.maskBitmap?.recycle()
+                                it.cropBitmap?.recycle()
+                            }
                         }
                     }
                 } catch (e: Exception) {

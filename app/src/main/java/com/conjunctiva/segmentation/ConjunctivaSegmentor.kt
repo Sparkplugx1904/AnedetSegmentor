@@ -26,6 +26,7 @@ private const val NUM_MASK_COEFFS = 32
 data class SegmentResult(
     val boundingBox: RectF,          // Dalam koordinat bitmap asli (setelah rotasi)
     val maskBitmap: Bitmap?,         // Masker 160x160 as Bitmap
+    val cropBitmap: Bitmap?,         // Crop konjungtiva untuk preview
     val confidence: Float
 )
 
@@ -84,14 +85,13 @@ class ConjunctivaSegmentor(private val context: Context) {
         val origW = bitmap.width
         val origH = bitmap.height
 
-        // 1. Calculate Letterbox Resize
-        val scale = minOf(INPUT_SIZE.toFloat() / origW, INPUT_SIZE.toFloat() / origH)
+        val scale = minOf(640f / origW, 640f / origH)
         val newW = (origW * scale).toInt()
         val newH = (origH * scale).toInt()
 
         val imageProcessor = ImageProcessor.Builder()
             .add(ResizeOp(newH, newW, ResizeOp.ResizeMethod.BILINEAR))
-            .add(ResizeWithCropOrPadOp(INPUT_SIZE, INPUT_SIZE))
+            .add(ResizeWithCropOrPadOp(640, 640))
             .add(NormalizeOp(0f, 255f))
             .build()
 
@@ -105,16 +105,14 @@ class ConjunctivaSegmentor(private val context: Context) {
         )
         interp.runForMultipleInputsOutputs(arrayOf(processedImage.buffer), outputs)
 
-        // Metadata for coordinate mapping
-        // ResizeWithCropOrPadOp places image in center
-        val offsetX = (INPUT_SIZE - newW) / 2f
-        val offsetY = (INPUT_SIZE - newH) / 2f
+        val offsetX = (640f - newW) / 2f
+        val offsetY = (640f - newH) / 2f
 
-        return postprocess(origW, origH, scale, offsetX, offsetY)
+        return postprocess(bitmap, scale, offsetX, offsetY)
     }
 
     private fun postprocess(
-        origW: Int, origH: Int,
+        originalBitmap: Bitmap,
         scale: Float, offsetX: Float, offsetY: Float
     ): List<SegmentResult> {
         val results = mutableListOf<SegmentResult>()
@@ -126,33 +124,57 @@ class ConjunctivaSegmentor(private val context: Context) {
             val confidence = boxes[offset + 4]
             if (confidence < CONF_THRESHOLD) continue
 
-            val cx = boxes[offset + 0]
-            val cy = boxes[offset + 1]
-            val w = boxes[offset + 2]
-            val h = boxes[offset + 3]
+            // YOLOv8 output is x1,y1,x2,y2 in normalized [0,1] for the 640x640 input
+            val x1n = boxes[offset + 0]
+            val y1n = boxes[offset + 1]
+            val x2n = boxes[offset + 2]
+            val y2n = boxes[offset + 3]
 
-            // 1. Map Box to original frame
-            val x1 = (cx - w / 2f - offsetX) / scale
-            val y1 = (cy - h / 2f - offsetY) / scale
-            val x2 = (cx + w / 2f - offsetX) / scale
-            val y2 = (cy + h / 2f - offsetY) / scale
-            val mappedRect = RectF(x1, y1, x2, y2)
+            // 1. Map Box to original frame coordinates
+            // Map normalized to 640px space, then inverse letterbox
+            val x1 = (x1n * 640f - offsetX) / scale
+            val y1 = (y1n * 640f - offsetY) / scale
+            val x2 = (x2n * 640f - offsetX) / scale
+            val y2 = (y2n * 640f - offsetY) / scale
 
-            // 2. Generate Mask Bitmap (Perform dot product on background thread)
+            val mappedRect = RectF(
+                x1.coerceIn(0f, originalBitmap.width.toFloat()),
+                y1.coerceIn(0f, originalBitmap.height.toFloat()),
+                x2.coerceIn(0f, originalBitmap.width.toFloat()),
+                y2.coerceIn(0f, originalBitmap.height.toFloat())
+            )
+
+            if (mappedRect.width() <= 0 || mappedRect.height() <= 0) continue
+
+            // 2. Generate Mask Bitmap
             val coeffs = FloatArray(NUM_MASK_COEFFS) { boxes[offset + 6 + it] }
             val maskBitmap = generateMaskBitmap(protos, coeffs)
 
-            results.add(SegmentResult(mappedRect, maskBitmap, confidence))
+            // 3. Create Crop for preview
+            val crop = try {
+                Bitmap.createBitmap(
+                    originalBitmap,
+                    mappedRect.left.toInt(),
+                    mappedRect.top.toInt(),
+                    mappedRect.width().toInt(),
+                    mappedRect.height().toInt()
+                )
+            } catch (e: Exception) {
+                null
+            }
+
+            results.add(SegmentResult(mappedRect, maskBitmap, crop, confidence))
         }
 
-        // Return only the best detection for conjunctiva
-        return if (results.isEmpty()) emptyList() else listOf(results.maxBy { it.confidence })
+        // Return only the largest detection for conjunctiva
+        return if (results.isEmpty()) emptyList()
+        else listOf(results.maxBy { it.boundingBox.width() * it.boundingBox.height() })
     }
 
     private fun generateMaskBitmap(protos: FloatArray, coeffs: FloatArray): Bitmap {
         val maskBitmap = Bitmap.createBitmap(protoW, protoH, Bitmap.Config.ARGB_8888)
         val pixels = IntArray(protoW * protoH)
-        
+
         val purple = Color.parseColor("#AA66CC")
         val r = Color.red(purple)
         val g = Color.green(purple)
@@ -167,7 +189,6 @@ class ConjunctivaSegmentor(private val context: Context) {
                     sum += protos[pOffset + k] * coeffs[k]
                 }
 
-                // Sigmoid check (sum > 0 is equivalent to sigmoid(sum) > 0.5)
                 if (sum > 0f) {
                     pixels[y * protoW + x] = Color.argb(alpha, r, g, b)
                 } else {

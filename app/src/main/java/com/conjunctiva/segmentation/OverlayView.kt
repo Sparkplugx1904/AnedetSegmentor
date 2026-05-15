@@ -26,6 +26,12 @@ class OverlayView @JvmOverloads constructor(
         typeface = Typeface.DEFAULT_BOLD
     }
 
+    private val cropBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+
     fun setResults(results: List<SegmentResult>, width: Int, height: Int) {
         this.results = results
         this.imageWidth = width
@@ -57,25 +63,29 @@ class OverlayView @JvmOverloads constructor(
             // 3. Draw Label
             val label = "Conjunctiva: ${(result.confidence * 100).toInt()}%"
             canvas.drawText(label, scaledRect.left, scaledRect.top - 10f, textPaint)
+
+            // 4. Draw Crop Preview
+            result.cropBitmap?.let { crop ->
+                drawCropPreview(canvas, crop)
+            }
         }
     }
 
     private fun drawMask(canvas: Canvas, maskBitmap: Bitmap, sx: Float, sy: Float) {
-        // Correcting Inverse Letterbox Mapping for Overlay
-        // Mask 160x160 -> Model Input 640x640
-        // Mapping mask pixels to original image pixels
-
         val matrix = Matrix()
 
         // 1. Scale mask (160x160) to fit model input size (640x640)
         val maskToInputScale = 640f / maskBitmap.width
         matrix.postScale(maskToInputScale, maskToInputScale)
 
-        // 2. Map from 640x640 back to original frame coordinates
+        // 2. Inverse Letterbox: Map from 640x640 back to original frame coordinates
         val scale = minOf(640f / imageWidth, 640f / imageHeight)
         val offsetX = (640f - imageWidth * scale) / 2f
         val offsetY = (640f - imageHeight * scale) / 2f
 
+        // Correct order:
+        // 1. Subtract offset (translate to non-padded region)
+        // 2. Scale back to original frame dimensions
         matrix.postTranslate(-offsetX, -offsetY)
         matrix.postScale(1f/scale, 1f/scale)
 
@@ -83,5 +93,17 @@ class OverlayView @JvmOverloads constructor(
         matrix.postScale(sx, sy)
 
         canvas.drawBitmap(maskBitmap, matrix, null)
+    }
+
+    private fun drawCropPreview(canvas: Canvas, cropBitmap: Bitmap) {
+        val previewW = (width * 0.3f).toInt().coerceAtLeast(200)
+        val previewH = (previewW * (cropBitmap.height.toFloat() / cropBitmap.width)).toInt()
+        val margin = 20f
+
+        val destRect = RectF(margin, margin, margin + previewW, margin + previewH)
+        canvas.drawBitmap(cropBitmap, null, destRect, null)
+        canvas.drawRect(destRect, cropBorderPaint)
+
+        canvas.drawText("CROP", margin + 10f, destRect.bottom - 10f, Paint(textPaint).apply { textSize = 30f })
     }
 }
